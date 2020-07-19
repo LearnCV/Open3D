@@ -1,85 +1,107 @@
+language: cpp
+env:
+  global:
+    - SHARED=OFF
+    - BUILD_DEPENDENCY_FROM_SOURCE=OFF
+    - BUILD_TENSORFLOW_OPS=ON
+    - BUILD_CUDA_MODULE=OFF
+    - NPROC=2
+
+notifications:
+  email:
+    on_success: never
+    on_failure: always
+
 matrix:
 
-  notifications:
-    email: false # turn off email notifications for build failure
-
-  language:
-    - python
-    - cpp
-
   include:
-    # Default environment of Ubuntu 14.04
+    # Style check only
     - os: linux
-      dist: trusty
+      dist: bionic
       sudo: true
+      language: python
+      python: "3.6"
       addons:
         apt:
           sources:
             - ubuntu-toolchain-r-test
           packages:
-            - gcc-4.8
-            - g++-4.8
-            - cmake-data # to use cmake 3.0 or more recent
             - cmake
-      env:
-         - PYTHON=3.6 CC=gcc-4.8 CXX=g++-4.8
+            - clang-7
+            - clang-format-5.0
+      install:
+        - ./util/scripts/install-deps-ubuntu.sh assume-yes
+      script:
+        - mkdir build
+        - cd build
+        - cmake ..
+        - pip install -U yapf==0.28.0 nbformat
+        - make check-style
 
-    # Similar environment of Ubuntu 16.04 (gcc 5.4)
-    # travis ci only supports Ubuntu 14.04 (trusty) gcc-5 and 6
-    # another option is to use docker.
+    # Build headless and docs
     - os: linux
-      dist: trusty
+      dist: bionic
       sudo: true
+      language: python
+      python: "3.6"
       addons:
         apt:
           sources:
             - ubuntu-toolchain-r-test
           packages:
-            - gcc-6
-            - g++-6
-            - cmake-data # to use cmake 3.0 or more recent
             - cmake
-      env:
-         - PYTHON=3.6 CC=gcc-6 && CXX=g++-6
+            - doxygen
+            - texlive
+            - texlive-latex-extra
+            - ghostscript
+            - pandoc
+            - libosmesa6-dev
+      install:
+        # Install ubuntu dependencies
+        - ./util/scripts/install-deps-ubuntu.sh assume-yes
+        # Install Kinect k4a package
+        - curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+        - sudo apt-add-repository --yes https://packages.microsoft.com/ubuntu/18.04/prod
+        - sudo apt-get update
+        # Accept EULA using a temporary workaround
+        # https://github.com/microsoft/Azure-Kinect-Sensor-SDK/issues/1190#issuecomment-618473882
+        - DEBIAN_FRONTEND=noninteractive
+        - echo 'libk4a1.4 libk4a1.4/accepted-eula-hash string 0f5d5c5de396e4fee4c0753a21fee0c1ed726cf0316204edda484f08cb266d76' | sudo debconf-set-selections
+        - echo 'libk4a1.4 libk4a1.4/accept-eula boolean true' | sudo debconf-set-selections
+        - sudo apt-get --yes install libk4a1.4 libk4a1.4-dev k4a-tools
+        # Install Python dependencies for building docs
+        - which python
+        - python -V
+        - pip install -U -q "sphinx>=3.0" sphinx-rtd-theme nbsphinx Pillow
+        # m2r needs a patch for sphinx 3
+        # https://github.com/sphinx-doc/sphinx/issues/7420
+        - pip install -U -q git+https://github.com/intel-isl/m2r@dev#egg=m2r
+      script:
+        - nproc
+        - mkdir build
+        - cd build
+        - |
+          cmake \
+                -DENABLE_HEADLESS_RENDERING=ON \
+                -DENABLE_JUPYTER=ON \
+                -DENABLE_GUI=OFF \
+                -DBUILD_GLEW=ON \
+                -DBUILD_GLFW=ON \
+                -DWITH_OPENMP=ON \
+                -DBUILD_AZURE_KINECT=ON \
+                ..
+        - make install-pip-package -j$NPROC
+        - make -j$NPROC
+        - bin/GLInfo
+        - python -c "from open3d import *; import open3d; print(open3d)"
+        - cd .. # Back to Open3D/
+        - ./util/scripts/make-documentation.sh
+        - ./.travis/deploy_docs.sh
 
-    # Default environment of MacOS El Capitan
-    # compiled using clang shipped with xcode8
-    - os: osx
-      osx_image: xcode8
-      env:
-         - PYTHON=3.6
+    # - env: DOCKER=YES UBUNTU=16.04 BUNDLE=deps ENV=py3 LINK=STATIC
+    #   script: ./util/docker/open3d-test/tools/test.sh $UBUNTU $BUNDLE $ENV $LINK
+    #   install: sudo apt-get update && sudo apt-get install -y realpath
 
-    # Default environment of MacOS Sierra
-    # compiled using clang shipped with xcode8.3
-    - os: osx
-      osx_image: xcode8.3
-      env:
-         - PYTHON=3.6
-
-before_install:
-  # ISSUE: we may want to use '/scripts/install-deps-ubuntu.sh' in the future.
-  # At this moment, travis-ci supports up to ubuntu 14.04 and this environment
-  # does not recognize sudo apt-get install libglfw3-dev
-  # custom build GLFW3
-  - if [ "$TRAVIS_OS_NAME" == "linux" ]; then
-      sudo apt-get install -y xorg-dev libglu1-mesa-dev libgl1-mesa-glx libglew-dev libjsoncpp-dev libeigen3-dev;
-      python -m pip install --user --upgrade pip wheel;
-      pyenv global system 3.6;
-    fi
-  # scripts/install-deps-osx.sh works well
-  - if [ "$TRAVIS_OS_NAME" == "osx" ]; then
-      brew install python;
-      ./scripts/install-deps-osx.sh;
-    fi
-  # for reference, display cmake and python version
-  - python -V
-  - cmake --version
-
-script:
-  # Build commands
-  - mkdir build
-  - cd build
-  - cmake ../src/
-  # make -j brings 'virtual memory exhausted: Cannot allocate memory' message
-  # this is presumably due to limited memory space of travis-ci
-  - make
+    # - env: DOCKER=YES UBUNTU=16.04 BUNDLE=deps ENV=py3 LINK=SHARED
+    #   script: ./util/docker/open3d-test/tools/test.sh $UBUNTU $BUNDLE $ENV $LINK
+    #   install: sudo apt-get update && sudo apt-get install -y realpath
