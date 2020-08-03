@@ -142,6 +142,7 @@ const int Window::FLAG_TOPMOST = (1 << 0);
 struct Window::Impl {
     GLFWwindow* window_ = nullptr;
     std::string title_;  // there is no glfwGetWindowTitle()...
+    std::unordered_map<Menu::ItemId, std::function<void()>> menu_callbacks_;
     // We need these for mouse moves and wheel events.
     // The only source of ground truth is button events, so the rest of
     // the time we monitor key up/down events.
@@ -270,6 +271,7 @@ Window::Window(const std::string& title,
     style.WindowBorderSize = 0;
     style.FrameBorderSize = theme.border_width;
     style.FrameRounding = theme.border_radius;
+    style.ChildRounding = theme.border_radius;
     style.Colors[ImGuiCol_WindowBg] = colorToImgui(theme.background_color);
     style.Colors[ImGuiCol_Text] = colorToImgui(theme.text_color);
     style.Colors[ImGuiCol_Border] = colorToImgui(theme.border_color);
@@ -359,6 +361,10 @@ Window::~Window() {
     glfwDestroyWindow(impl_->window_);
 }
 
+const std::vector<std::shared_ptr<Widget>>& Window::GetChildren() const {
+    return impl_->children_;
+}
+
 void* Window::MakeDrawContextCurrent() const {
     auto old_context = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(impl_->imgui_.context);
@@ -402,6 +408,14 @@ void Window::SetTitle(const char* title) {
 //       after MakeDrawContextCurrent() has been called), otherwise
 //       ImGUI won't be able to access the font.
 Size Window::CalcPreferredSize() {
+    // If we don't have any children--unlikely, but might happen when you're
+    // experimenting and just create an empty window to see if you understand
+    // how to config the library--return a non-zero size, since a size of (0, 0)
+    // will end up with a crash.
+    if (impl_->children_.empty()) {
+        return Size(640 * impl_->imgui_.scaling, 480 * impl_->imgui_.scaling);
+    }
+
     Rect bbox(0, 0, 0, 0);
     for (auto& child : impl_->children_) {
         auto pref = child->CalcPreferredSize(GetTheme());
@@ -506,6 +520,11 @@ void Window::AddChild(std::shared_ptr<Widget> w) {
     impl_->needs_layout_ = true;
 }
 
+void Window::SetOnMenuItemActivated(Menu::ItemId item_id,
+                                    std::function<void()> callback) {
+    impl_->menu_callbacks_[item_id] = callback;
+}
+
 void Window::ShowDialog(std::shared_ptr<Dialog> dlg) {
     if (impl_->active_dialog_) {
         CloseDialog();
@@ -535,6 +554,11 @@ void Window::CloseDialog() {
         SetFocusWidget(nullptr);
     }
     impl_->active_dialog_.reset();
+    // The dialog might not be closing from within a draw call, such as when
+    // a native file dialog closes, so we need to post a redraw, just in case.
+    // If it is from within a draw call, then any redraw request from that will
+    // get merged in with this one by the OS.
+    PostRedraw();
 }
 
 void Window::ShowMessageBox(const char* title, const char* message) {
@@ -562,7 +586,13 @@ void Window::Layout(const Theme& theme) {
     }
 }
 
-void Window::OnMenuItemSelected(Menu::ItemId item_id) {}
+void Window::OnMenuItemSelected(Menu::ItemId item_id) {
+    auto callback = impl_->menu_callbacks_.find(item_id);
+    if (callback != impl_->menu_callbacks_.end()) {
+        callback->second();
+        PostRedraw();  // might not be in a draw if from native menu
+    }
+}
 
 namespace {
 enum Mode { NORMAL, DIALOG, NO_INPUT };
@@ -840,6 +870,11 @@ void Window::OnResize() {
                 screen_width = mode->width;
                 screen_height = mode->height;
             }
+            // TODO: if we can update GLFW we can replace the above with this
+            //       Also, see below.
+            // int xpos, ypos;
+            // glfwGetMonitorWorkarea(monitor, &xpos, &ypos,
+            //                       &screen_width, &screen_height);
         }
 
         int w = GetOSFrame().width;
@@ -854,7 +889,13 @@ void Window::OnResize() {
 
             w = std::min(screen_width,
                          int(std::round(pref.width / impl_->imgui_.scaling)));
-            h = std::min(screen_height,
+            // screen_height is the screen height, not the usable screen height.
+            // If we cannot call glfwGetMonitorWorkarea(), then we need to guess
+            // at the size. The window titlebar is about 2 * em, and then there
+            // is often a global menubar (Linux/GNOME, macOS) or a toolbar
+            // (Windows). A toolbar is somewhere around 2 - 3 ems.
+            int unusable_height = 4 * impl_->theme_.font_size;
+            h = std::min(screen_height - unusable_height,
                          int(std::round(pref.height / impl_->imgui_.scaling)));
             glfwSetWindowSize(impl_->window_, w, h);
         }
@@ -1061,7 +1102,7 @@ void Window::DrawCallback(GLFWwindow* window) {
         // Can't just draw here, because Filament sometimes fences within
         // a draw, and then you can get two draws happening at the same
         // time, which ends up with a crash.
-        PostNativeExposeEvent(w->impl_->window_);
+        w->PostRedraw();
     }
 }
 
@@ -1251,9 +1292,7 @@ void Window::CloseCallback(GLFWwindow* window) {
     Application::GetInstance().RemoveWindow(w);
 }
 
-void Window::UpdateAfterEvent(Window* w) {
-    PostNativeExposeEvent(w->impl_->window_);
-}
+void Window::UpdateAfterEvent(Window* w) { w->PostRedraw(); }
 
 }  // namespace gui
 }  // namespace visualization
